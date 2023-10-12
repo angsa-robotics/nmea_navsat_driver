@@ -14,6 +14,7 @@
 
 import socket
 import sys
+from time import sleep
 
 import rclpy
 
@@ -46,7 +47,9 @@ def main(args=None):
             gnss_socket.connect((gnss_ip, gnss_port))
         except socket.error as exc:
             driver.get_logger().error("Caught exception socket.error when setting up socket: %s" % exc)
-            sys.exit(1)
+            sleep(5.0)
+            driver.get_logger().info("Trying again now.")
+            continue
 
         # recv-loop: When we're connected, keep receiving stuff until that fails
         partial = ""
