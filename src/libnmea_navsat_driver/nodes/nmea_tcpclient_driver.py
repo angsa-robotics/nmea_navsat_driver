@@ -14,6 +14,7 @@
 
 import socket
 import sys
+import time
 from time import sleep
 
 import rclpy
@@ -25,9 +26,11 @@ def main(args=None):
     driver = Ros2NMEADriver()
 
     try:
-        gnss_ip = driver.declare_parameter('ip', '192.168.131.22').value
-        gnss_port = driver.declare_parameter('port', 9001).value
+        gnss_ip = driver.declare_parameter('ip', '192.168.0.70').value
+        gnss_port = driver.declare_parameter('port', 9111).value
         buffer_size = driver.declare_parameter('buffer_size', 4096).value
+        socket_timeout = driver.declare_parameter('socket_timeout', 5.0).value
+        no_data_reconnection_timeout = driver.declare_parameter('no_data_reconnection_timeout', 20).value
     except KeyError as e:
         driver.get_logger().err("Parameter %s not found" % e)
         sys.exit(1)
@@ -44,7 +47,9 @@ def main(args=None):
             gnss_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
             # Connect to the gnss sensor
+            gnss_socket.settimeout(socket_timeout)
             gnss_socket.connect((gnss_ip, gnss_port))
+            last_data_packet_time = time.time()
         except socket.error as exc:
             driver.get_logger().error("Caught exception socket.error when setting up socket: %s" % exc)
             sleep(5.0)
@@ -53,34 +58,51 @@ def main(args=None):
 
         # recv-loop: When we're connected, keep receiving stuff until that fails
         partial = ""
-        while rclpy.ok():
+        try:
+            while rclpy.ok():
+                try:
+                    gnss_socket.settimeout(socket_timeout)
+                    partial += gnss_socket.recv(buffer_size).decode("ascii")
+
+                    if time.time() > last_data_packet_time + no_data_reconnection_timeout:
+                        driver.get_logger().error(f"No data since {time.time() - last_data_packet_time:.1f}s, recreating socket.")
+                        raise TimeoutError
+
+                    # strip the data
+                    lines = partial.splitlines()
+                    if partial.endswith('\n'):
+                        full_lines = lines
+                        partial = ""
+                    else:
+                        full_lines = lines[:-1]
+                        partial = lines[-1]
+
+                    if not full_lines:
+                        driver.get_logger().warn("No data from device...", throttle_duration_sec=5.0)
+                        sleep(0.05)
+                        continue
+                    last_data_packet_time = time.time()
+
+                    for data in full_lines:
+                        try:
+                            if driver.add_sentence(data, frame_id):
+                                driver.get_logger().info("Received sentence: %s" % data)
+                            else:
+                                driver.get_logger().warn("Error with sentence: %s" % data)
+                        except ValueError as e:
+                            driver.get_logger().warn(
+                                "Value error, likely due to missing fields in the NMEA message. "
+                                "Error was: %s. Please report this issue to me. " % e)
+
+                except socket.error as exc:
+                    driver.get_logger().error("Caught exception socket.error when receiving: %s" % exc)
+                    break
+                except TimeoutError:
+                    # Create new socket in outer loop
+                    break
+        finally:
             try:
-                partial += gnss_socket.recv(buffer_size).decode("ascii")
-
-                # strip the data
-                lines = partial.splitlines()
-                if partial.endswith('\n'):
-                    full_lines = lines
-                    partial = ""
-                else:
-                    full_lines = lines[:-1]
-                    partial = lines[-1]
-
-                for data in full_lines:
-                    try:
-                        if driver.add_sentence(data, frame_id):
-                            driver.get_logger().info("Received sentence: %s" % data)
-                        else:
-                            driver.get_logger().warn("Error with sentence: %s" % data)
-                    except ValueError as e:
-                        driver.get_logger().warn(
-                            "Value error, likely due to missing fields in the NMEA message. "
-                            "Error was: %s. Please report this issue to me. " % e)
-
-            except socket.error as exc:
-                driver.get_logger().error("Caught exception socket.error when receiving: %s" % exc)
+                driver.get_logger().info(f"Closing old socket")
                 gnss_socket.close()
-                break
-
-
-        gnss_socket.close()
+            except Exception as e:
+                driver.get_logger().error(f"Failed to shut down socket: {e}")
